@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════════
+# tgd-ctl v9.3 — Herramienta de gestión TGD-SCHED
+# Mecanismo: setpriority() / nice values (sin cgroups)
+# ═══════════════════════════════════════════════════════════════════
+
+LEARNED_FILE="/var/lib/tgd-sched/learned.csv"
+TGD_LOG="/tmp/tgd.log"
+NTVIDIA_SCORES="/run/ntvidia/scores"
+MU="-0.20"
+SIGMA="0.40"
+
+GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[1;33m'
+RED='\033[0;31m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+daemon_pid() { pgrep -x tgd-sched 2>/dev/null | head -1; }
+is_running()  { [[ -n "$(daemon_pid)" ]]; }
+require_root(){ [[ $EUID -eq 0 ]] || { echo -e "${RED}Requiere sudo${NC}"; exit 1; }; }
+
+expected_nice() {
+    python3 -c "
+import math
+cpu = float('${1:-0}')
+gpu = float('${2:-0}')
+mu = $MU; sigma = $SIGMA
+gpu_eff = gpu * min(cpu, 1.0)
+x = max(-1.0, min(1.0, 0.45*(cpu*0.80) + 0.25*(gpu_eff*0.80) + 0.20*0.20))
+norm = math.exp(-0.5*((x-mu)/sigma)**2)
+nice = int(round(-5 + 24*(1-norm)))
+print(f'{x:+.3f},{norm:.3f},{nice}')
+" 2>/dev/null
+}
+
+cmd_status() {
+    echo -e "${BOLD}═══ TGD-SCHED v9.3 ═══${NC}"
+    echo ""
+    if is_running; then
+        local pid cpu
+        pid=$(daemon_pid)
+        cpu=$(ps -p "$pid" -o %cpu --no-headers 2>/dev/null | tr -d ' ')
+        echo -e "  Daemon:   ${GREEN}ACTIVO${NC}  PID=$pid  CPU=${cpu}%"
+    else
+        echo -e "  Daemon:   ${RED}INACTIVO${NC}"
+        echo -e "  ${DIM}Arrancar: sudo /usr/local/sbin/tgd-sched > /tmp/tgd.log 2>&1 &${NC}"
+    fi
+    local n_managed
+    n_managed=$(ps -eo pid,nice --no-headers 2>/dev/null | \
+        awk '$2 != 0 && $2 >= -5 && $2 <= 19' | wc -l)
+    echo "  Gestionados: $n_managed procesos con nice≠0"
+    if [[ -f "$TGD_LOG" ]]; then
+        local last_sigma
+        last_sigma=$(tail -20 "$TGD_LOG" 2>/dev/null | grep -oP 'σ=\K[0-9.]+' | tail -1)
+        [[ -n "$last_sigma" ]] && echo "  Modelo:   μ=$MU  σ=$last_sigma  nice∈[-5,+19]"
+    fi
+    if [[ -f "$LEARNED_FILE" ]]; then
+        local n_learned top_proc
+        n_learned=$(grep -c -v '^#' "$LEARNED_FILE" 2>/dev/null || echo 0)
+        top_proc=$(grep -v '^#' "$LEARNED_FILE" 2>/dev/null | \
+            sort -t',' -k2 -rn | head -1 | cut -d',' -f1)
+        echo "  Learned:  $n_learned procesos  (más pesado: $top_proc)"
+    fi
+    if [[ -d "$NTVIDIA_SCORES" ]]; then
+        local n_gpu
+        n_gpu=$(ls "$NTVIDIA_SCORES" 2>/dev/null | wc -l)
+        echo "  NTvidia:  activo ($n_gpu procesos con score GPU)"
+    else
+        echo -e "  NTvidia:  ${DIM}no instalado${NC}"
+    fi
+    echo ""
+    echo -e "${DIM}  tgd-ctl nice     → ver nice values actuales"
+    echo -e "  tgd-ctl top      → top por CPU con contexto TGD"
+    echo -e "  tgd-ctl learned  → historial de aprendizaje${NC}"
+}
+
+cmd_nice() {
+    echo -e "${BOLD}═══ Nice values TGD actuales ═══${NC}"
+    echo ""
+    printf "  ${CYAN}%-8s %-20s %-6s %-8s %-8s %s${NC}\n" \
+        "PID" "comm" "nice" "cpu%" "gpu" "clasificación"
+    printf "  %s\n" "$(printf '─%.0s' {1..62})"
+
+    ps -eo pid,comm,nice,%cpu --no-headers --sort=nice 2>/dev/null | \
+    while read -r pid comm nice cpu; do
+        [[ "$nice" =~ ^-?[0-9]+$ ]] || continue
+        local cpu_int
+        cpu_int=$(echo "$cpu" | cut -d. -f1)
+        if (( nice < 0 )); then
+            case "$comm" in
+                gnome-shell|Xorg|mutter*|tilix|brave|ntvidia|pipewire*|wireplumber)
+                    ;;
+                kworker*|irq/*|rcu*|ksoftirq*|migration*|idle_inject*)
+                    continue ;;
+                *)
+                    (( cpu_int < 3 )) && continue ;;
+            esac
+        fi
+
+        local color="$GREEN"
+        (( nice >= 8  )) && color="$RED"
+        (( nice >= 3 && nice < 8 )) && color="$YELLOW"
+        (( nice < 0  )) && color="$CYAN"
+
+        local gpu_str="-"
+        if [[ -f "$NTVIDIA_SCORES/$comm" ]]; then
+            local gema
+            gema=$(grep "^gpu_ema=" "$NTVIDIA_SCORES/$comm" 2>/dev/null | \
+                cut -d= -f2 | cut -c1-5)
+            [[ -n "$gema" ]] && gpu_str="${gema}"
+        fi
+
+        local tag=""
+        (( nice >= 8  )) && tag="${RED}← HOG${NC}"
+        (( nice >= 3 && nice < 8 )) && tag="${YELLOW}← activo${NC}"
+        (( nice <= -3 )) && tag="${CYAN}← UI prioritario${NC}"
+
+        printf "  %-8s %-20s ${color}%-6s${NC} %-8s %-8s " \
+            "$pid" "${comm:0:20}" "$nice" "$cpu%" "$gpu_str"
+        echo -e "$tag"
+    done
+    echo ""
+    echo -e "${DIM}  Procesos idle omitidos${NC}"
+}
+
+cmd_top() {
+    echo -e "${BOLD}═══ Top procesos (TGD) ═══${NC}"
+    echo ""
+    printf "  ${CYAN}%-8s %-20s %-7s %-6s %-8s %-6s %s${NC}\n" \
+        "PID" "comm" "%CPU" "nice" "gpu_ema" "x" "estado"
+    printf "  %s\n" "$(printf '─%.0s' {1..68})"
+
+    ps -eo pid,comm,%cpu,nice --no-headers --sort=-%cpu 2>/dev/null | \
+    head -12 | \
+    while read -r pid comm cpu nice; do
+        [[ "$nice" =~ ^-?[0-9]+$ ]] || nice="-"
+        local gpu="0.000"
+        if [[ -f "$NTVIDIA_SCORES/$comm" ]]; then
+            gpu=$(grep "^gpu_ema=" "$NTVIDIA_SCORES/$comm" 2>/dev/null | \
+                cut -d= -f2)
+            gpu="${gpu:-0.000}"
+        fi
+
+        local result x_val nice_exp
+        result=$(expected_nice "$cpu" "$gpu" 2>/dev/null)
+        x_val=$(echo "$result"   | cut -d',' -f1)
+        nice_exp=$(echo "$result" | cut -d',' -f3)
+
+        local color="$GREEN" state="normal" cpu_int
+        cpu_int=$(echo "$cpu" | cut -d. -f1)
+        (( cpu_int >= 50 )) && { color="$RED";    state="HOG"; }
+        (( cpu_int >= 20 && cpu_int < 50 )) && { color="$YELLOW"; state="activo"; }
+        [[ "$nice" =~ ^-[0-9]+ ]] && (( nice <= -3 )) && state="UI/sys"
+
+        printf "  %-8s %-20s ${color}%-7s${NC} %-6s %-8s %-6s %s\n" \
+            "$pid" "${comm:0:20}" "$cpu%" "$nice" \
+            "${gpu:0:5}" "${x_val:-?}" "$state"
+    done
+}
+
+cmd_force() {
+    require_root
+    local pid="${1:-}" nice="${2:-0}"
+    [[ -z "$pid" ]] && {
+        echo "Uso: tgd-ctl force <pid> [nice]"
+        echo "  nice: -5 (máxima prioridad) → +19 (mínima)"
+        return 1
+    }
+    [[ ! -d "/proc/$pid" ]] && { echo "PID $pid no existe"; return 1; }
+    local comm old_nice
+    comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo "?")
+    old_nice=$(ps -p "$pid" -o nice --no-headers 2>/dev/null | tr -d ' ')
+    renice -n "$nice" -p "$pid" 2>/dev/null
+    echo -e "${GREEN}$comm (PID=$pid): nice $old_nice → $nice${NC}"
+    echo -e "${DIM}  TGD puede sobrescribirlo en el próximo ciclo (800ms)${NC}"
+}
+
+cmd_reset() {
+    require_root
+    local pid="${1:-}"
+    [[ -z "$pid" ]] && { echo "Uso: tgd-ctl reset <pid>"; return 1; }
+    local comm
+    comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo "?")
+    renice -n 0 -p "$pid" 2>/dev/null
+    echo -e "${YELLOW}$comm (PID=$pid) → nice=0${NC}"
+}
+
+cmd_learned() {
+    echo -e "${BOLD}═══ Historial de aprendizaje ═══${NC}"
+    echo -e "${DIM}  $LEARNED_FILE${NC}"
+    echo ""
+    if [[ ! -f "$LEARNED_FILE" ]]; then
+        echo "  Sin historial todavía (~60s para primer guardado)"
+        return
+    fi
+    printf "  ${CYAN}%-22s %-12s %-8s %s${NC}\n" \
+        "comm" "smooth_cpu" "nice_esp" "clase"
+    printf "  %s\n" "$(printf '─%.0s' {1..52})"
+    grep -v '^#' "$LEARNED_FILE" 2>/dev/null | \
+    sort -t',' -k2 -rn | \
+    while IFS=',' read -r comm cpu; do
+        local label color result nice_exp
+        result=$(expected_nice "$cpu" "0" 2>/dev/null)
+        nice_exp=$(echo "$result" | cut -d',' -f3)
+        if (( $(echo "$cpu > 0.60" | bc -l 2>/dev/null || echo 0) )); then
+            label="HOG";    color="$RED"
+        elif (( $(echo "$cpu > 0.15" | bc -l 2>/dev/null || echo 0) )); then
+            label="activo"; color="$YELLOW"
+        else
+            label="ligero"; color="$GREEN"
+        fi
+        printf "  ${color}%-22s %-12s %-8s %s${NC}\n" \
+            "${comm:0:22}" "$cpu" "${nice_exp:-?}" "$label"
+    done
+}
+
+cmd_log() {
+    if [[ ! -f "$TGD_LOG" ]]; then
+        echo "No hay log en $TGD_LOG"
+        return
+    fi
+    echo -e "${BOLD}═══ TGD log (últimas 20 líneas) ═══${NC}"
+    tail -20 "$TGD_LOG"
+    echo ""
+    echo -e "${DIM}  tail -f $TGD_LOG   → log en tiempo real${NC}"
+}
+
+cmd_stop() {
+    require_root
+    echo -e "${YELLOW}Deteniendo TGD-SCHED...${NC}"
+    touch /tmp/tgd-shutdown
+    sleep 2
+    pkill -f tgd-sched 2>/dev/null || true
+    sleep 1
+    rm -f /tmp/tgd-shutdown
+    echo -e "${GREEN}Detenido${NC}"
+}
+
+case "${1:-status}" in
+    status)  cmd_status ;;
+    nice)    cmd_nice ;;
+    top)     cmd_top ;;
+    force)   cmd_force "${2:-}" "${3:-0}" ;;
+    reset)   cmd_reset "${2:-}" ;;
+    learned) cmd_learned ;;
+    log)     cmd_log ;;
+    stop)    cmd_stop ;;
+    *)
+        echo -e "${BOLD}tgd-ctl${NC} — TGD-SCHED v9.3"
+        echo ""
+        echo "  tgd-ctl status           → estado del daemon"
+        echo "  tgd-ctl nice             → nice values actuales"
+        echo "  tgd-ctl top              → top por CPU con contexto TGD"
+        echo "  tgd-ctl force <pid> [n]  → forzar nice para un PID"
+        echo "  tgd-ctl reset <pid>      → restaurar nice=0"
+        echo "  tgd-ctl learned          → historial de aprendizaje"
+        echo "  tgd-ctl log              → últimas líneas del log"
+        echo "  tgd-ctl stop             → detener daemon limpiamente"
+        ;;
+esac

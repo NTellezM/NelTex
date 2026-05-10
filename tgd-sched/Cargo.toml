@@ -1,0 +1,13 @@
+[package]
+name = "tgd-sched"
+version = "9.3.0"
+edition = "2021"
+description = "TGD Topologic Gaussian Density Scheduler"
+
+[[bin]]
+name = "tgd-sched"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+strip = true

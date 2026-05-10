@@ -1,0 +1,13 @@
+[package]
+name = "ntvidia"
+version = "3.0.0"
+edition = "2021"
+description = "NTvidia Gaussian GPU Scheduler"
+
+[[bin]]
+name = "ntvidia"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+strip = true
